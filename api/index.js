@@ -5,7 +5,7 @@ const MAX_HISTORY_ENTRY_BYTES = 440;
 const MAX_SESSION_STATE_BYTES = 1024;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1200;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -186,7 +186,7 @@ async function searchWeb(query, timeoutMs) {
 
     return items.length ? items.join("\n") : "";
   } catch (error) {
-    console.warn("Serper request failed or timed out.");
+    console.warn("Serper request failed or timed out.", error?.name || "Error", error?.cause?.code || "");
     return "";
   }
 }
@@ -341,7 +341,7 @@ export default async function handler(req, res) {
         text,
         Math.min(
           SERPER_TIMEOUT_MS,
-          Math.max(0, remainingMs() - 2600)
+          Math.max(0, remainingMs() - 2000)
         )
       );
 
