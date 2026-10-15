@@ -5,7 +5,7 @@ const MAX_HISTORY_ENTRY_BYTES = 440;
 const MAX_SESSION_STATE_BYTES = 1024;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 1200;
+const SERPER_TIMEOUT_MS = 2200;
 const GEMINI_TIMEOUT_MS = 2500;
 
 const SYSTEM_PROMPT = [
@@ -134,7 +134,7 @@ async function fetchJson(url, options, timeoutMs) {
 
 async function searchWeb(query, timeoutMs) {
   const key = process.env.SERPER_API_KEY;
-  if (!key || timeoutMs < 150) return "";
+  if (!key || timeoutMs < 150) return null;
 
   try {
     const { response, data } = await fetchJson(
@@ -160,35 +160,60 @@ async function searchWeb(query, timeoutMs) {
         "Serper request failed with HTTP",
         response.status
       );
-      return "";
+      return null;
     }
 
     const items = (
-      Array.isArray(data.organic) ? data.organic : []
+      Array.isArray(data?.organic) ? data.organic : []
     )
       .slice(0, 3)
-      .map((item, i) => {
-        const title = String(item.title || "").slice(0, 180);
-        const snippet = String(item.snippet || "").slice(0, 350);
-        const link = String(item.link || "").slice(0, 240);
-
-        return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
-      });
+      .filter(item => item && typeof item === "object")
+      .map(item => ({
+        title: cleanSearchText(item.title, 180),
+        snippet: cleanSearchText(item.snippet, 350),
+        link: typeof item.link === "string" ? item.link.slice(0, 240) : ""
+      }))
+      .filter(item => item.snippet);
 
     const answerBox =
-      data.answerBox?.answer || data.answerBox?.snippet;
+      cleanSearchText(data?.answerBox?.answer, 350) ||
+      cleanSearchText(data?.answerBox?.snippet, 350);
+
+    const context = items.map((item, i) =>
+      `${i + 1}. ${item.title}: ${item.snippet} ${item.link}`.trim()
+    );
 
     if (answerBox) {
-      items.unshift(
-        `Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`
-      );
+      context.unshift(`Краткий ответ поисковика: ${answerBox}`);
     }
 
-    return items.length ? items.join("\n") : "";
+    if (!context.length) {
+      console.warn("Serper returned no usable search results.");
+      return null;
+    }
+
+    return {
+      context: context.join("\n"),
+      fallbackText: fitAliceText(
+        "В результатах поиска: " + (answerBox || items[0].snippet)
+      )
+    };
   } catch (error) {
     console.warn("Serper request failed or timed out.", error?.name || "Error", error?.cause?.code || "");
-    return "";
+    return null;
   }
+}
+
+function cleanSearchText(value, maxLength) {
+  if (typeof value !== "string" && typeof value !== "number") return "";
+
+  return String(value)
+    .replace(/https?:\/\/\S+/gi, "")
+    .replace(/<[^>]*>/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxLength)
+    .trim();
 }
 
 async function askGemini(text, history, searchContext, timeoutMs) {
@@ -299,6 +324,7 @@ export default async function handler(req, res) {
     return res.status(200).json({
       ok: true,
       service: "alice-gemini-serper",
+      build: "search-fallback-1",
       message: "Webhook is ready. Yandex Dialogs should send POST requests to /api."
     });
   }
@@ -325,6 +351,12 @@ export default async function handler(req, res) {
 
   const oldHistory = safeHistory(body?.state?.session?.history);
 
+  const answerWithHistory = answer => aliceResponse(answer, false, [
+    ...oldHistory,
+    { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+    { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+  ]);
+
   if (!text) {
     return res.status(200).json(aliceResponse(
       "Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?",
@@ -333,19 +365,19 @@ export default async function handler(req, res) {
     ));
   }
 
-  try {
-    let searchContext = "";
+  let searchResult = null;
 
+  try {
     if (isSearchIntent(text)) {
-      searchContext = await searchWeb(
+      searchResult = await searchWeb(
         text,
         Math.min(
           SERPER_TIMEOUT_MS,
-          Math.max(0, remainingMs() - 2000)
+          Math.max(0, remainingMs() - 800)
         )
       );
 
-      if (!searchContext) {
+      if (!searchResult) {
         return res.status(200).json(aliceResponse(
           "Сейчас не удалось получить свежие данные из интернета. Попробуйте ещё раз немного позже.",
           false,
@@ -357,28 +389,14 @@ export default async function handler(req, res) {
     const answer = await askGemini(
       text,
       oldHistory,
-      searchContext,
+      searchResult?.context || "",
       Math.max(
         0,
         Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)
       )
     );
 
-    const history = [
-      ...oldHistory,
-      {
-        role: "user",
-        text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      },
-      {
-        role: "model",
-        text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS)
-      }
-    ].slice(-MAX_HISTORY_MESSAGES);
-
-    return res.status(200).json(
-      aliceResponse(answer, false, history)
-    );
+    return res.status(200).json(answerWithHistory(answer));
   } catch (error) {
     const safeError =
       error?.name === "AbortError" ||
@@ -390,6 +408,10 @@ export default async function handler(req, res) {
       "Alice webhook returned a fallback response:",
       safeError?.message || "unknown error"
     );
+
+    if (searchResult?.fallbackText) {
+      return res.status(200).json(answerWithHistory(searchResult.fallbackText));
+    }
 
     return res.status(200).json(
       aliceResponse(errorForUser(safeError), false, oldHistory)
